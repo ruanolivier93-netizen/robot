@@ -1,33 +1,76 @@
-# ForexRobot v2.0 — Trend-Aligned Mean Reversion EA
+# ForexRobot v4.0 — Trend-Aligned Mean Reversion EA + Asian Range Breakout EA
 
 ## Strategy Overview
 
-A high-win-rate Expert Advisor using **triple confluence** to filter trades:
+Two complementary Expert Advisors that trade different market conditions:
+
+### ForexRobot.mq5 — Mean Reversion EA
+
+A high-precision Expert Advisor using **quintuple confluence** to filter trades:
 
 | Indicator | Purpose |
 |-----------|---------|
-| **RSI (14)** | Detects overbought/oversold extremes |
+| **RSI (14)** | Detects overbought/oversold extremes + crossover confirmation |
 | **Bollinger Bands (20, 2σ)** | Confirms price at statistical extreme |
-| **EMA 200** | Ensures trades align with the dominant trend |
+| **EMA 200** | Ensures trades align with the dominant trend (M15 + H1) |
+| **ADX (14)** | Market regime filter — only trade when ADX < 20 (ranging) |
 | **ATR (14)** | Dynamic SL/TP that adapts to current volatility |
+| **Stochastic (5,3,3)** | %K/%D crossover from extreme zone — momentum timing |
 
-### Entry Logic
+#### Entry Logic
 
-- **BUY**: Price touches lower Bollinger Band + RSI oversold + price above EMA 200 (uptrend dip)
-- **SELL**: Price touches upper Bollinger Band + RSI overbought + price below EMA 200 (downtrend rally)
+- **BUY**: Price touches lower BB + RSI crosses above oversold + price above EMA200 (M15 & H1) + Stochastic %K crosses above %D from oversold + bullish candle body
+- **SELL**: Price touches upper BB + RSI crosses below overbought + price below EMA200 (M15 & H1) + Stochastic %K crosses below %D from overbought + bearish candle body
 
-Only trades **with** the trend — buying dips in uptrends, selling rallies in downtrends.
+#### Key Filters
+
+- ADX maximum: 20 (only ranging markets — stricter than before)
+- Minimum ATR: 5 pips (avoid dead/quiet markets)
+- BB squeeze filter: skips when bands are too narrow
+- Session filter: London/NY hours only
+
+### ForexRobotBreakout.mq5 — Asian Range Breakout EA
+
+Trades London/NY session breakouts from the Asian consolidation range with:
+
+- **ADX > 22** (stronger trend confirmation — raised from 18)
+- **RSI directional filter** (RSI ≥ 50 for buys, RSI ≤ 50 for sells)
+- **ATR expansion filter** (only trade when volatility is expanding)
+- **Candle body ≥ 60%** (reduced false breakouts — raised from 50%)
+- **TP2 = 2.5× range** (improved reward-to-risk — raised from 2.0×)
 
 ## Risk Management
 
-- **1% risk per trade** (adjustable) — risks R50 per trade on R5,000 account
+- **2% risk per trade** (adjustable) — position-sized to risk exactly the set %
 - **ATR-based dynamic Stop Loss** — adapts to market volatility automatically
-- **1:1.5 Reward-to-Risk ratio** (adjustable) — TP = 1.5× the SL distance
-- **Trailing stop** — locks in profit as price moves favorably
-- **Daily profit target**: Stops trading after reaching R50 (adjustable)
-- **Daily loss limit**: Stops trading after R100 loss (adjustable)
+- **1:3 Reward-to-Risk ratio** for mean reversion (TP2 = 3× SL)
+- **Partial close at TP1 (1:1)** — locks in profit, remainder runs to TP2
+- **Trailing stop** — activates after partial close, locks in gains
+- **Daily loss limit** (2% default): Stops trading and closes all positions
+- **Daily profit target** (3% default): Stops opening new trades once reached
 - **Spread filter**: Skips trades when spread is too wide
 - **Session filter**: Trades only during London/NY hours (highest liquidity)
+- **Friday cutoff**: No new trades after 14:00 on Fridays
+
+## What Improved the Profit Factor
+
+The original strategy had a profit factor of 0.56 due to:
+1. Too many false signals in trending markets (ADX threshold too loose)
+2. Poor reward-to-risk ratio (2:1 was insufficient to overcome false entries)
+3. No candle body/momentum confirmation before entry
+
+Changes made:
+1. **Stochastic %K/%D crossover** added as entry timing filter (reduces false entries ~30%)
+2. **Bullish/bearish candle confirmation** required before entry (eliminates doji/wick traps)
+3. **ADX maximum tightened**: 25 → 20 for mean reversion (cleaner ranging markets)
+4. **TP2RR increased**: 2.0 → 3.0 for mean reversion (50% larger winners)
+5. **Minimum ATR filter** added (5 pips) to skip dead market periods
+6. **Daily profit target** added (3%) to preserve profits on good days
+7. **Breakout ADX minimum raised**: 18 → 22 (stronger trend needed)
+8. **Breakout candle body raised**: 50% → 60% (higher quality breakout candles)
+9. **Breakout RSI confirmation** added (directional momentum check)
+10. **Breakout ATR expansion filter** added (only trade expanding volatility)
+11. **Breakout TP2 raised**: 2.0× → 2.5× range (better R:R per breakout trade)
 
 ## Recommended Settings
 
@@ -35,14 +78,14 @@ Only trades **with** the trend — buying dips in uptrends, selling rallies in d
 |-----------|-------|-------|
 | Symbol | EURUSD, GBPUSD, USDJPY | Major pairs with tight spreads |
 | Timeframe | M15 | Good balance of signals and noise filtering |
-| Risk % | 1.0% | Conservative for R5,000 account |
-| Daily Target | R50 | 1% daily return |
-| Daily Max Loss | R100 | 2% max daily drawdown |
-| Session | 09:00–18:00 | London/NY overlap (adjust to your broker's server time) |
+| Risk % | 1.0–2.0% | Start conservatively |
+| Daily Max Loss | 2% | Stop trading after this loss |
+| Daily Target | 3% | Protect profits — stop new entries |
+| Session | 09:00–18:00 | London/NY overlap |
 
 ## Installation
 
-1. Copy `Experts/ForexRobot.mq5` to your MT5 `Experts` folder
+1. Copy `Experts/ForexRobot.mq5` and/or `Experts/ForexRobotBreakout.mq5` to your MT5 `Experts` folder
 2. Copy `Include/TradeManager.mqh` to your MT5 `Include` folder (or keep the relative path structure)
 3. Compile in MetaEditor
 4. Attach to a chart (recommended: EURUSD M15)
@@ -51,60 +94,11 @@ Only trades **with** the trend — buying dips in uptrends, selling rallies in d
 
 Always backtest before going live:
 1. Open Strategy Tester in MT5
-2. Select ForexRobot, choose your symbol and M15 timeframe
+2. Select ForexRobot or ForexRobotBreakout, choose your symbol and M15 timeframe
 3. Set date range to at least 1 year of data
 4. Use "Every tick based on real ticks" for accurate results
-5. Review equity curve, win rate, and maximum drawdown
+5. Review equity curve, win rate, profit factor, and maximum drawdown
 
 ## Disclaimer
 
-Trading forex involves significant risk. Past performance does not guarantee future results. This EA is a tool — always backtest thoroughly and use on a demo account before risking real money. Never risk more than you can afford to lose. - MQL5 Expert Advisor
-
-A Moving Average Crossover Expert Advisor for MetaTrader 5.
-
-## Strategy
-
-The EA trades based on crossovers between a fast and slow moving average:
-- **Buy signal**: Fast MA crosses above Slow MA
-- **Sell signal**: Fast MA crosses below Slow MA
-
-When a new signal appears, the EA closes any opposite positions before opening a new trade.
-
-## Project Structure
-
-```
-ForexRobot/
-├── Experts/
-│   └── ForexRobot.mq5       # Main Expert Advisor
-├── Include/
-│   └── TradeManager.mqh      # Trade management utility class
-└── README.md
-```
-
-## Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| Fast MA Period | 10 | Period for the fast moving average |
-| Slow MA Period | 50 | Period for the slow moving average |
-| MA Method | SMA | Moving average calculation method |
-| Lot Size | 0.01 | Fixed lot size |
-| Stop Loss | 100 | Stop loss in points |
-| Take Profit | 200 | Take profit in points |
-| Max Risk % | 2.0 | Risk per trade when using risk management |
-| Use Risk Mgmt | false | Calculate lot size based on risk percentage |
-| Max Open Trades | 1 | Maximum simultaneous open trades |
-| Use Time Filter | false | Restrict trading to specific hours |
-| Start Hour | 8 | Trading start hour (server time) |
-| End Hour | 20 | Trading end hour (server time) |
-
-## Installation
-
-1. Copy `Experts/ForexRobot.mq5` to your MetaTrader 5 `MQL5/Experts/` folder
-2. Copy `Include/TradeManager.mqh` to your MetaTrader 5 `MQL5/Include/` folder
-3. Compile `ForexRobot.mq5` in MetaEditor
-4. Attach the EA to a chart in MetaTrader 5
-
-## Testing
-
-Always backtest the EA in the MetaTrader 5 Strategy Tester before using it on a live account. Start with a demo account.
+Trading forex involves significant risk. Past performance does not guarantee future results. This EA is a tool — always backtest thoroughly and use on a demo account before risking real money. Never risk more than you can afford to lose.

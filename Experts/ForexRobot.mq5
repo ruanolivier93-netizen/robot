@@ -27,7 +27,7 @@ input double            InpBBDeviation     = 2.0;           // Bollinger Bands D
 input int               InpEMATrend        = 200;           // Trend EMA Period
 input int               InpATRPeriod       = 14;            // ATR Period (for dynamic SL/TP)
 input int               InpADXPeriod       = 14;            // ADX Period
-input double            InpADXMaximum      = 25.0;          // ADX Maximum (skip trending — mean reversion needs ranging)
+input double            InpADXMaximum      = 20.0;          // ADX Maximum (skip trending — mean reversion needs ranging)
 input ENUM_TIMEFRAMES   InpTimeframe       = PERIOD_M15;    // Trading Timeframe
 
 input group "== Risk & Money Management =="
@@ -40,12 +40,13 @@ input int               InpMaxTotalTrades  = 4;             // Max Total Open Tr
 
 input group "== Partial Close & Targets =="
 input double            InpTP1RR           = 1.0;           // TP1 Reward:Risk (close half here)
-input double            InpTP2RR           = 2.0;           // TP2 Reward:Risk (final target)
+input double            InpTP2RR           = 3.0;           // TP2 Reward:Risk (final target)
 input double            InpPartialClosePC  = 50.0;          // Partial Close % at TP1
 input double            InpBEBufferPts     = 5.0;           // Breakeven Buffer (points above entry)
 
 input group "== Daily Risk Limit (auto-scales with balance) =="
 input double            InpDailyMaxLossPC  = 2.0;           // Max Daily Loss (% of balance) - stop trading
+input double            InpDailyTargetPC   = 3.0;           // Daily Profit Target (% of balance) - stop trading
 
 input group "== Session Filter (Server Time) =="
 input bool              InpUseSessionFilter = true;         // Enable Session Filter
@@ -58,7 +59,16 @@ input bool              InpUseTrailingStop = true;          // Enable Trailing S
 input double            InpTrailATRMult    = 1.0;           // Trailing Stop ATR Multiplier
 input int               InpFridayCutoffHour = 14;           // Friday Cutoff Hour (no new trades after this)
 input double            InpMinBBWidthATR   = 1.0;           // Min BB Width (x ATR) - skip squeeze
+input double            InpMinATRPips      = 5.0;           // Min ATR (pips) to trade — skip dead markets
 input ENUM_TIMEFRAMES   InpHTFTimeframe    = PERIOD_H1;     // Higher Timeframe for Trend Confirmation
+
+input group "== Stochastic Confirmation =="
+input int               InpStochKPeriod    = 5;             // Stochastic %K Period
+input int               InpStochDPeriod    = 3;             // Stochastic %D Period
+input int               InpStochSlowing    = 3;             // Stochastic Slowing
+input double            InpStochOversold   = 25.0;          // Stochastic Oversold Level
+input double            InpStochOverbought = 75.0;          // Stochastic Overbought Level
+input double            InpStochCrossZone  = 20.0;          // Stochastic Cross Zone Width (% above oversold / below overbought)
 
 //--- Per-symbol indicator handles
 struct SSymbolData
@@ -70,6 +80,7 @@ struct SSymbolData
    int      handleATR;
    int      handleADX;
    int      handleHTF_EMA;   // Higher timeframe EMA for trend confirmation
+   int      handleStoch;     // Stochastic oscillator for additional confirmation
    datetime lastBarTime;
 };
 
@@ -84,6 +95,8 @@ double bbLowerBuffer[];
 double emaBuffer[];
 double atrBuffer[];
 double adxBuffer[];
+double stochKBuffer[];
+double stochDBuffer[];
 
 //--- Trade manager
 CTradeManager tradeManager;
@@ -172,10 +185,14 @@ int OnInit()
       g_symbols[i].handleATR = iATR(symList[i], InpTimeframe, InpATRPeriod);
       g_symbols[i].handleADX = iADX(symList[i], InpTimeframe, InpADXPeriod);
       g_symbols[i].handleHTF_EMA = iMA(symList[i], InpHTFTimeframe, InpEMATrend, 0, MODE_EMA, PRICE_CLOSE);
+      g_symbols[i].handleStoch = iStochastic(symList[i], InpTimeframe, InpStochKPeriod,
+                                              InpStochDPeriod, InpStochSlowing,
+                                              MODE_SMA, STO_LOWHIGH);
 
       if(g_symbols[i].handleRSI == INVALID_HANDLE || g_symbols[i].handleBB == INVALID_HANDLE ||
          g_symbols[i].handleEMA == INVALID_HANDLE || g_symbols[i].handleATR == INVALID_HANDLE ||
-         g_symbols[i].handleADX == INVALID_HANDLE || g_symbols[i].handleHTF_EMA == INVALID_HANDLE)
+         g_symbols[i].handleADX == INVALID_HANDLE || g_symbols[i].handleHTF_EMA == INVALID_HANDLE ||
+         g_symbols[i].handleStoch == INVALID_HANDLE)
       {
          Print("Error: Failed to create indicators for ", symList[i]);
          return INIT_FAILED;
@@ -190,6 +207,8 @@ int OnInit()
    ArraySetAsSeries(emaBuffer, true);
    ArraySetAsSeries(atrBuffer, true);
    ArraySetAsSeries(adxBuffer, true);
+   ArraySetAsSeries(stochKBuffer, true);
+   ArraySetAsSeries(stochDBuffer, true);
 
    //--- Initialize trade manager
    tradeManager.Init(InpMagicNumber, InpTradeComment, InpMaxTradesPerSym);
@@ -204,7 +223,8 @@ int OnInit()
          ") + EMA(", InpEMATrend, ") + ADX(", InpADXPeriod, "<", InpADXMaximum,
          ") + ATR(", InpATRPeriod, ")");
    Print("Risk: ", InpRiskPercent, "% | TP1: 1:", InpTP1RR, " (close ", InpPartialClosePC,
-         "%) | TP2: 1:", InpTP2RR, " | Daily Target: R", InpDailyTarget);
+         "%) | TP2: 1:", InpTP2RR, " | Daily Max Loss: ", InpDailyMaxLossPC,
+         "% | Daily Target: ", InpDailyTargetPC, "%");
 
    return INIT_SUCCEEDED;
 }
@@ -222,6 +242,7 @@ void OnDeinit(const int reason)
       if(g_symbols[i].handleATR != INVALID_HANDLE) IndicatorRelease(g_symbols[i].handleATR);
       if(g_symbols[i].handleADX != INVALID_HANDLE) IndicatorRelease(g_symbols[i].handleADX);
       if(g_symbols[i].handleHTF_EMA != INVALID_HANDLE) IndicatorRelease(g_symbols[i].handleHTF_EMA);
+      if(g_symbols[i].handleStoch != INVALID_HANDLE) IndicatorRelease(g_symbols[i].handleStoch);
    }
    Print("ForexRobot deinitialized. Reason: ", reason);
 }
@@ -246,6 +267,18 @@ void OnTick()
          Print("DAILY MAX LOSS REACHED: R", NormalizeDouble(totalDailyPL, 2),
                " | Limit: R", NormalizeDouble(dailyMaxLoss, 2), " (", InpDailyMaxLossPC, "%) - Closing ALL positions.");
          tradeManager.CloseAllSymbols();
+      }
+      return;
+   }
+
+   //--- Daily profit target: stop opening new trades once target is hit
+   double dailyTarget = balance * InpDailyTargetPC / 100.0;
+   if(totalDailyPL >= dailyTarget)
+   {
+      // Let existing positions run to their TP/SL; just don't open new ones
+      for(int s = 0; s < g_symbolCount; s++)
+      {
+         ManageOpenPosition(s);
       }
       return;
    }
@@ -329,9 +362,12 @@ void ProcessSymbol(int symIdx)
    if(CopyBuffer(g_symbols[symIdx].handleEMA, 0, 0, 3, emaBuffer) < 3) return;
    if(CopyBuffer(g_symbols[symIdx].handleATR, 0, 0, 3, atrBuffer) < 3) return;
    if(CopyBuffer(g_symbols[symIdx].handleADX, 0, 0, 3, adxBuffer) < 3) return;  // ADX main line
+   if(CopyBuffer(g_symbols[symIdx].handleStoch, 0, 0, 3, stochKBuffer) < 3) return;  // %K line
+   if(CopyBuffer(g_symbols[symIdx].handleStoch, 1, 0, 3, stochDBuffer) < 3) return;  // %D signal line
 
    //--- Get price data for the symbol
    double close1 = iClose(symbol, InpTimeframe, 1);
+   double open1  = iOpen(symbol, InpTimeframe, 1);
    double low1   = iLow(symbol, InpTimeframe, 1);
    double high1  = iHigh(symbol, InpTimeframe, 1);
 
@@ -339,11 +375,19 @@ void ProcessSymbol(int symIdx)
    double atrValue = atrBuffer[1];
    if(atrValue <= 0) return;
 
+   //--- ========== MINIMUM ATR FILTER ==========
+   //  Skip dead/quiet markets where mean reversion trades are unprofitable
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   int    digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   double minATRPrice = (digits == 5 || digits == 3) ? InpMinATRPips * 10.0 * point
+                                                      : InpMinATRPips * point;
+   if(atrValue < minATRPrice)
+      return;  // Market too quiet — skip
+
    double slDistance  = atrValue * InpATRMultSL;
 
    //--- Enforce minimum stop level
    double minStopPoints = (double)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
    double minStopDist = minStopPoints * point;
    if(slDistance < minStopDist)
       slDistance = minStopDist;
@@ -378,6 +422,8 @@ void ProcessSymbol(int symIdx)
    //  5. ADX < maximum (ranging market) — CHECKED ABOVE
    //  6. BB not in squeeze — CHECKED ABOVE
    //  7. H1 EMA confirms uptrend
+   //  8. Stochastic %K crossed above %D from oversold zone (momentum confirmation)
+   //  9. Candle body confirmation: last bar must be bullish
    bool buySignal = false;
    if(low1 <= bbLowerBuffer[1])
    {
@@ -387,7 +433,14 @@ void ProcessSymbol(int symIdx)
          {
             if(close1 > bbLowerBuffer[1])
             {
-               buySignal = true;
+               // Stochastic: %K crossed above %D from oversold zone
+               bool stochBuy = (stochKBuffer[2] <= stochDBuffer[2] &&
+                                stochKBuffer[1] > stochDBuffer[1] &&
+                                stochKBuffer[1] < InpStochOversold + InpStochCrossZone);
+               // Candle body: bullish close (close > open)
+               bool bullishBar = (close1 > open1);
+               if(stochBuy && bullishBar)
+                  buySignal = true;
             }
          }
       }
@@ -401,6 +454,8 @@ void ProcessSymbol(int symIdx)
    //  5. ADX < maximum (ranging market) — CHECKED ABOVE
    //  6. BB not in squeeze — CHECKED ABOVE
    //  7. H1 EMA confirms downtrend
+   //  8. Stochastic %K crossed below %D from overbought zone (momentum confirmation)
+   //  9. Candle body confirmation: last bar must be bearish
    bool sellSignal = false;
    if(high1 >= bbUpperBuffer[1])
    {
@@ -410,7 +465,14 @@ void ProcessSymbol(int symIdx)
          {
             if(close1 < bbUpperBuffer[1])
             {
-               sellSignal = true;
+               // Stochastic: %K crossed below %D from overbought zone
+               bool stochSell = (stochKBuffer[2] >= stochDBuffer[2] &&
+                                 stochKBuffer[1] < stochDBuffer[1] &&
+                                 stochKBuffer[1] > InpStochOverbought - InpStochCrossZone);
+               // Candle body: bearish close (close < open)
+               bool bearishBar = (close1 < open1);
+               if(stochSell && bearishBar)
+                  sellSignal = true;
             }
          }
       }
@@ -426,6 +488,7 @@ void ProcessSymbol(int symIdx)
       double sl  = ask - slDistance;
       double tp  = ask + tp2Distance;
       Print(">>> BUY ", symbol, " | RSI=", NormalizeDouble(rsiBuffer[1], 1),
+            " | StochK=", NormalizeDouble(stochKBuffer[1], 1),
             " | ADX=", NormalizeDouble(adxValue, 1),
             " | SL=", NormalizeDouble(slDistance/point, 0), "pts",
             " | TP1=", NormalizeDouble((slDistance*InpTP1RR)/point, 0),
@@ -438,6 +501,7 @@ void ProcessSymbol(int symIdx)
       double sl  = bid + slDistance;
       double tp  = bid - tp2Distance;
       Print(">>> SELL ", symbol, " | RSI=", NormalizeDouble(rsiBuffer[1], 1),
+            " | StochK=", NormalizeDouble(stochKBuffer[1], 1),
             " | ADX=", NormalizeDouble(adxValue, 1),
             " | SL=", NormalizeDouble(slDistance/point, 0), "pts",
             " | TP1=", NormalizeDouble((slDistance*InpTP1RR)/point, 0),

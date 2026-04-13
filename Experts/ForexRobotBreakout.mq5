@@ -35,6 +35,7 @@ struct SBreakoutData
    datetime       lastBarTime;
    int            handleATR;
    int            handleADX;
+   int            handleRSI;     // RSI for directional confirmation
 };
 
 //--- Input parameters
@@ -52,9 +53,16 @@ input double            InpMinRangePips     = 15.0;         // Minimum Asian Ran
 input double            InpMaxRangePips     = 80.0;         // Maximum Asian Range (pips) - skip huge ranges
 input double            InpBreakoutBuffer   = 3.0;          // Buffer above/below range for entry (pips)
 input int               InpADXPeriod        = 14;           // ADX Period (trend strength)
-input double            InpADXMinimum       = 18.0;         // ADX Minimum for breakout confirmation
+input double            InpADXMinimum       = 22.0;         // ADX Minimum for breakout confirmation
 input int               InpATRPeriod        = 14;           // ATR Period
+input double            InpATRExpansionMult = 1.1;          // ATR Expansion: current ATR must be >= avg ATR * this
+input int               InpATRAvgPeriod     = 20;           // ATR Average Period (for expansion filter)
 input double            InpMaxSpread        = 20.0;         // Max Spread (points)
+
+input group "== RSI Directional Confirmation =="
+input int               InpRSIPeriod        = 14;           // RSI Period
+input double            InpRSIBullMin       = 50.0;         // RSI minimum for buy breakout (momentum up)
+input double            InpRSIBearMax       = 50.0;         // RSI maximum for sell breakout (momentum down)
 
 input group "== Risk & Money Management =="
 input double            InpRiskPercent      = 2.0;          // Risk Per Trade (% of balance)
@@ -65,7 +73,7 @@ input int               InpMaxTotalTrades   = 3;            // Max Total Open Tr
 
 input group "== Take Profit & Partial Close =="
 input double            InpTP1Mult          = 1.0;          // TP1 = Range Size * this (partial close)
-input double            InpTP2Mult          = 2.0;          // TP2 = Range Size * this (final target)
+input double            InpTP2Mult          = 2.5;          // TP2 = Range Size * this (final target)
 input double            InpPartialClosePC   = 50.0;         // Partial Close % at TP1
 input double            InpBEBufferPts      = 5.0;          // Breakeven Buffer (points)
 input bool              InpUseMidRangeSL    = false;        // SL at mid-range instead of opposite side
@@ -75,6 +83,7 @@ input double            InpSLBuffer         = 5.0;          // SL Buffer beyond 
 
 input group "== Daily Risk Limit (auto-scales with balance) =="
 input double            InpDailyMaxLossPC   = 2.0;          // Max Daily Loss (% of balance)
+input double            InpDailyTargetPC    = 3.0;          // Daily Profit Target (% of balance) - stop new trades
 
 input group "== Trailing Stop =="
 input bool              InpUseTrailingStop  = true;         // Enable Trailing Stop
@@ -87,6 +96,7 @@ input ENUM_TIMEFRAMES   InpTimeframe        = PERIOD_M15;   // Chart Timeframe
 //--- Global data
 SBreakoutData  g_symbols[];
 int            g_symbolCount = 0;
+bool           g_dailyTargetHit = false;  // When true: manage existing trades only, no new entries
 
 //--- Trade manager
 CTradeManager tradeManager;
@@ -196,10 +206,12 @@ int OnInit()
       g_symbols[i].lastResetDay = 0;
       g_symbols[i].lastBarTime  = 0;
 
-      g_symbols[i].handleATR = iATR(symList[i], InpTimeframe, InpATRPeriod);
-      g_symbols[i].handleADX = iADX(symList[i], InpTimeframe, InpADXPeriod);
+      g_symbols[i].handleATR    = iATR(symList[i], InpTimeframe, InpATRPeriod);
+      g_symbols[i].handleADX    = iADX(symList[i], InpTimeframe, InpADXPeriod);
+      g_symbols[i].handleRSI    = iRSI(symList[i], InpTimeframe, InpRSIPeriod, PRICE_CLOSE);
 
-      if(g_symbols[i].handleATR == INVALID_HANDLE || g_symbols[i].handleADX == INVALID_HANDLE)
+      if(g_symbols[i].handleATR == INVALID_HANDLE || g_symbols[i].handleADX == INVALID_HANDLE ||
+         g_symbols[i].handleRSI == INVALID_HANDLE)
       {
          Print("Error: Failed to create indicators for ", symList[i]);
          return INIT_FAILED;
@@ -231,6 +243,7 @@ void OnDeinit(const int reason)
    {
       if(g_symbols[i].handleATR != INVALID_HANDLE) IndicatorRelease(g_symbols[i].handleATR);
       if(g_symbols[i].handleADX != INVALID_HANDLE) IndicatorRelease(g_symbols[i].handleADX);
+      if(g_symbols[i].handleRSI != INVALID_HANDLE) IndicatorRelease(g_symbols[i].handleRSI);
    }
    Print("ForexRobot Breakout deinitialized. Reason: ", reason);
 }
@@ -258,6 +271,17 @@ void OnTick()
       }
       return;
    }
+
+   //--- Daily profit target: let existing positions run but don't open new ones
+   double dailyTarget = balance * InpDailyTargetPC / 100.0;
+   if(totalDailyPL >= dailyTarget)
+   {
+      g_dailyTargetHit = true;
+      for(int s = 0; s < g_symbolCount; s++)
+         ProcessSymbol(s);  // Still manages trailing stops on existing positions
+      return;
+   }
+   g_dailyTargetHit = false;
 
    //--- Process each symbol
    for(int s = 0; s < g_symbolCount; s++)
@@ -390,6 +414,9 @@ void ProcessSymbol(int symIdx)
       // Friday cutoff — skip new entries
       if(fridayCutoff) return;
 
+      // Daily target hit — don't open new trades
+      if(g_dailyTargetHit) return;
+
       // Spread filter
       double spread = (double)SymbolInfoInteger(symbol, SYMBOL_SPREAD);
       if(spread > InpMaxSpread) return;
@@ -406,11 +433,34 @@ void ProcessSymbol(int symIdx)
       if(CopyBuffer(g_symbols[symIdx].handleADX, 0, 0, 2, adxBuf) < 2) return;
       if(adxBuf[1] < InpADXMinimum) return;  // Not trending enough
 
+      // ATR expansion filter — only trade when volatility is expanding
+      double atrBufEntry[];
+      ArraySetAsSeries(atrBufEntry, true);
+      if(CopyBuffer(g_symbols[symIdx].handleATR, 0, 0, 2, atrBufEntry) < 2) return;
+      // Use ATR on longer MA period as baseline; here we approximate by comparing current ATR vs recent bars
+      double atrAvgBuf[];
+      ArraySetAsSeries(atrAvgBuf, true);
+      // Re-use the ATR buffer: compute simple average of last InpATRAvgPeriod ATR values
+      double atrLongBuf[];
+      ArraySetAsSeries(atrLongBuf, true);
+      if(CopyBuffer(g_symbols[symIdx].handleATR, 0, 0, InpATRAvgPeriod + 1, atrLongBuf) < InpATRAvgPeriod + 1) return;
+      double atrSum = 0;
+      for(int k = 1; k <= InpATRAvgPeriod; k++) atrSum += atrLongBuf[k];
+      double atrAvg = atrSum / InpATRAvgPeriod;
+      if(atrBufEntry[1] < atrAvg * InpATRExpansionMult) return;  // Volatility not expanding
+
+      // RSI filter — confirm directional momentum
+      double rsiBuf[];
+      ArraySetAsSeries(rsiBuf, true);
+      if(CopyBuffer(g_symbols[symIdx].handleRSI, 0, 0, 2, rsiBuf) < 2) return;
+
       double buffer   = PipsToPrice(symbol, InpBreakoutBuffer);
       double slBuffer = PipsToPrice(symbol, InpSLBuffer);
       double high     = g_symbols[symIdx].asianHigh;
       double low      = g_symbols[symIdx].asianLow;
       double range    = g_symbols[symIdx].rangeSize;
+      double point    = SymbolInfoDouble(symbol, SYMBOL_POINT);
+      int    digits   = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
 
       // Check last closed bar for breakout confirmation
       double close1 = iClose(symbol, InpTimeframe, 1);
@@ -419,13 +469,18 @@ void ProcessSymbol(int symIdx)
       double open1  = iOpen(symbol, InpTimeframe, 1);
 
       //--- Candle body confirmation: reject weak breakouts (dojis, long wicks)
+      //  Increased threshold from 0.5 to 0.6 for higher quality breakout candles
       double body1     = MathAbs(close1 - open1);
       double barRange1 = high1 - low1;
-      bool strongBull  = (barRange1 > 0 && body1 / barRange1 >= 0.5 && close1 > open1);
-      bool strongBear  = (barRange1 > 0 && body1 / barRange1 >= 0.5 && close1 < open1);
+      bool strongBull  = (barRange1 > 0 && body1 / barRange1 >= 0.6 && close1 > open1);
+      bool strongBear  = (barRange1 > 0 && body1 / barRange1 >= 0.6 && close1 < open1);
 
-      bool breakoutUp   = (close1 > high + buffer) && strongBull;   // Strong bullish close above range
-      bool breakoutDown = (close1 < low - buffer)  && strongBear;   // Strong bearish close below range
+      // RSI directional check: bullish breakout needs RSI > InpRSIBullMin, bearish needs RSI < InpRSIBearMax
+      bool rsiBullish = (rsiBuf[1] >= InpRSIBullMin);
+      bool rsiBearish = (rsiBuf[1] <= InpRSIBearMax);
+
+      bool breakoutUp   = (close1 > high + buffer) && strongBull && rsiBullish;
+      bool breakoutDown = (close1 < low - buffer)  && strongBear && rsiBearish;
 
       if(breakoutUp)
       {
@@ -447,7 +502,6 @@ void ProcessSymbol(int symIdx)
          }
 
          //--- Enforce minimum stop level
-         double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
          double minStopPoints = (double)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
          double minStopDist = minStopPoints * point;
          if(slDistance < minStopDist)
@@ -457,16 +511,16 @@ void ProcessSymbol(int symIdx)
          tp = ask + tp2Dist;
          sl = ask - slDistance;
 
-         int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
          sl = NormalizeDouble(sl, digits);
          tp = NormalizeDouble(tp, digits);
 
          double lotSize = CalculateLotSize(symbol, slDistance);
-         double point   = SymbolInfoDouble(symbol, SYMBOL_POINT);
 
          Print(">>> BREAKOUT UP ", symbol,
                " | Close=", close1, " > AsianHigh=", high,
                " | ADX=", NormalizeDouble(adxBuf[1], 1),
+               " | RSI=", NormalizeDouble(rsiBuf[1], 1),
+               " | ATR=", NormalizeDouble(atrBufEntry[1]/point, 0), " pts (avg:", NormalizeDouble(atrAvg/point, 0), ")",
                " | Range=", NormalizeDouble(PriceInPips(symbol, range), 1), " pips",
                " | SL=", NormalizeDouble(slDistance/point, 0), " pts");
 
@@ -491,7 +545,6 @@ void ProcessSymbol(int symIdx)
          }
 
          //--- Enforce minimum stop level
-         double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
          double minStopPoints = (double)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
          double minStopDist = minStopPoints * point;
          if(slDistance < minStopDist)
@@ -501,16 +554,16 @@ void ProcessSymbol(int symIdx)
          tp = bid - tp2Dist;
          sl = bid + slDistance;
 
-         int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
          sl = NormalizeDouble(sl, digits);
          tp = NormalizeDouble(tp, digits);
 
          double lotSize = CalculateLotSize(symbol, slDistance);
-         double point   = SymbolInfoDouble(symbol, SYMBOL_POINT);
 
          Print(">>> BREAKOUT DOWN ", symbol,
                " | Close=", close1, " < AsianLow=", low,
                " | ADX=", NormalizeDouble(adxBuf[1], 1),
+               " | RSI=", NormalizeDouble(rsiBuf[1], 1),
+               " | ATR=", NormalizeDouble(atrBufEntry[1]/point, 0), " pts (avg:", NormalizeDouble(atrAvg/point, 0), ")",
                " | Range=", NormalizeDouble(PriceInPips(symbol, range), 1), " pips",
                " | SL=", NormalizeDouble(slDistance/point, 0), " pts");
 
@@ -554,6 +607,9 @@ void ResetIfNewDay(int symIdx)
       g_symbols[symIdx].asianHigh    = 0;
       g_symbols[symIdx].asianLow     = 999999;
       g_symbols[symIdx].rangeSize    = 0;
+      // Reset daily target flag when a new day begins (only needs to reset once)
+      if(symIdx == 0)
+         g_dailyTargetHit = false;
    }
 }
 
