@@ -36,6 +36,7 @@ struct SBreakoutData
    datetime       lastBarTime;
    int            handleATR;
    int            handleADX;
+   int            handleEMA;       // H1 EMA for trend filter
    ulong          pendingBuyTicket;
    ulong          pendingSellTicket;
 };
@@ -48,7 +49,7 @@ input group "== Asian Range Session (Server Time) =="
 input int               InpAsianStartHour   = 0;            // Asian Range Start Hour
 input int               InpAsianEndHour     = 6;            // Asian Range End Hour
 input int               InpBreakoutStartHr  = 7;            // Breakout Window Start (London open)
-input int               InpBreakoutEndHr    = 16;           // Breakout Window End (stop looking)
+input int               InpBreakoutEndHr    = 13;           // Breakout Window End (first 6 hrs of London only)
 
 input group "== Breakout Filters =="
 input double            InpMinRangePips     = 15.0;         // Minimum Asian Range (pips) - skip tiny ranges
@@ -67,11 +68,11 @@ input int               InpMaxTradesPerSym  = 1;            // Max Trades Per Sy
 input int               InpMaxTotalTrades   = 3;            // Max Total Open Trades
 
 input group "== Take Profit & Partial Close =="
-input double            InpTP1Mult          = 1.0;          // TP1 = Range Size * this (partial close)
+input double            InpTP1Mult          = 1.5;          // TP1 = Range Size * this (partial close, must cover >1R)
 input double            InpTP2Mult          = 2.0;          // TP2 = Range Size * this (final target)
 input double            InpPartialClosePC   = 50.0;         // Partial Close % at TP1
 input double            InpBEBufferPts      = 5.0;          // Breakeven Buffer (points)
-input bool              InpUseMidRangeSL    = true;         // SL at mid-range instead of opposite side
+input bool              InpUseMidRangeSL    = false;        // SL at mid-range instead of opposite side
 
 input group "== Stop Loss =="
 input double            InpSLBuffer         = 5.0;          // SL Buffer beyond range (pips)
@@ -84,6 +85,12 @@ input bool              InpUseTrailingStop  = true;         // Enable Trailing S
 input double            InpTrailATRMult     = 1.0;          // Trailing Stop ATR Multiplier
 input bool              InpUseTimeExit      = true;         // Close trades at end of breakout window
 input int               InpFridayCutoffHour = 14;           // Friday Cutoff Hour (no new trades after this)
+
+input group "== Trend Filter =="
+input bool              InpUseTrendFilter   = true;         // Enable H1 EMA trend filter (reduces false breakouts)
+input int               InpEMAPeriod        = 50;           // EMA Period on H1 for trend direction
+input double            InpMinDISpread      = 5.0;          // Minimum gap between +DI and -DI (stronger directional signal)
+input double            InpMinRRRatio       = 1.5;          // Minimum Risk:Reward ratio — skip trades below this
 
 input group "== Timeframe =="
 input ENUM_TIMEFRAMES   InpTimeframe        = PERIOD_M15;   // Chart Timeframe
@@ -204,8 +211,10 @@ int OnInit()
 
       g_symbols[i].handleATR = iATR(symList[i], InpTimeframe, InpATRPeriod);
       g_symbols[i].handleADX = iADX(symList[i], InpTimeframe, InpADXPeriod);
+      g_symbols[i].handleEMA = iMA(symList[i], PERIOD_H1, InpEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
 
-      if(g_symbols[i].handleATR == INVALID_HANDLE || g_symbols[i].handleADX == INVALID_HANDLE)
+      if(g_symbols[i].handleATR == INVALID_HANDLE || g_symbols[i].handleADX == INVALID_HANDLE
+         || g_symbols[i].handleEMA == INVALID_HANDLE)
       {
          Print("Error: Failed to create indicators for ", symList[i]);
          return INIT_FAILED;
@@ -222,8 +231,11 @@ int OnInit()
    Print("Symbols: ", symStr);
    Print("Asian Range: ", InpAsianStartHour, ":00-", InpAsianEndHour, ":00 | Breakout: ",
          InpBreakoutStartHr, ":00-", InpBreakoutEndHr, ":00");
-   Print("Range Filter: ", InpMinRangePips, "-", InpMaxRangePips, " pips | ADX > ", InpADXMinimum);
+   Print("Range Filter: ", InpMinRangePips, "-", InpMaxRangePips, " pips | ADX > ", InpADXMinimum,
+         " | DI Spread > ", InpMinDISpread);
    Print("Risk: ", InpRiskPercent, "% | TP1: ", InpTP1Mult, "x range | TP2: ", InpTP2Mult, "x range");
+   Print("Trend Filter: ", (InpUseTrendFilter ? "H1 EMA(" + string(InpEMAPeriod) + ") ON" : "OFF"),
+         " | Min R:R: ", InpMinRRRatio, ":1");
 
    return INIT_SUCCEEDED;
 }
@@ -237,6 +249,7 @@ void OnDeinit(const int reason)
    {
       if(g_symbols[i].handleATR != INVALID_HANDLE) IndicatorRelease(g_symbols[i].handleATR);
       if(g_symbols[i].handleADX != INVALID_HANDLE) IndicatorRelease(g_symbols[i].handleADX);
+      if(g_symbols[i].handleEMA != INVALID_HANDLE) IndicatorRelease(g_symbols[i].handleEMA);
    }
    Print("ForexRobot Breakout deinitialized. Reason: ", reason);
 }
@@ -413,6 +426,33 @@ void ProcessSymbol(int symIdx)
       if(CopyBuffer(g_symbols[symIdx].handleADX, 2, 0, 2, minusDI) < 2) return;
       if(adxBuf[1] < InpADXMinimum) return;  // Not trending enough
 
+      // Require a minimum gap between +DI and -DI (stronger directional signal)
+      double diGap = MathAbs(plusDI[1] - minusDI[1]);
+      if(diGap < InpMinDISpread) return;
+
+      bool bullBias = (plusDI[1]  > minusDI[1]);
+      bool bearBias = (minusDI[1] > plusDI[1]);
+
+      // H1 EMA trend filter — only trade with the higher-timeframe trend
+      if(InpUseTrendFilter)
+      {
+         double emaBuf[];
+         ArraySetAsSeries(emaBuf, true);
+         if(CopyBuffer(g_symbols[symIdx].handleEMA, 0, 0, 2, emaBuf) < 2) return;
+         double emaVal  = emaBuf[1];
+         double closeH1 = iClose(symbol, PERIOD_H1, 1);
+         if(bullBias && closeH1 <= emaVal)
+         {
+            Print(symbol, " - Trend filter: H1 close below EMA(", InpEMAPeriod, "). Skipping long.");
+            return;
+         }
+         if(bearBias && closeH1 >= emaVal)
+         {
+            Print(symbol, " - Trend filter: H1 close above EMA(", InpEMAPeriod, "). Skipping short.");
+            return;
+         }
+      }
+
       double buffer   = PipsToPrice(symbol, InpBreakoutBuffer);
       double slBuffer = PipsToPrice(symbol, InpSLBuffer);
       double high     = g_symbols[symIdx].asianHigh;
@@ -421,9 +461,6 @@ void ProcessSymbol(int symIdx)
       double point    = SymbolInfoDouble(symbol, SYMBOL_POINT);
       int    digits   = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
       double minStopDist = (double)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
-
-      bool bullBias = (plusDI[1]  > minusDI[1]);
-      bool bearBias = (minusDI[1] > plusDI[1]);
 
       if(bullBias)
       {
@@ -443,7 +480,17 @@ void ProcessSymbol(int symIdx)
          if(slDistance < minStopDist) slDistance = minStopDist;
          sl = NormalizeDouble(entryPrice - slDistance, digits);
 
-         double tp   = NormalizeDouble(entryPrice + range * InpTP2Mult, digits);
+         double tp2Dist = range * InpTP2Mult;
+         double rrRatio = (slDistance > 0) ? (tp2Dist / slDistance) : 0;
+         if(rrRatio < InpMinRRRatio)
+         {
+            Print(symbol, " - Long R:R too low: ", NormalizeDouble(rrRatio, 2),
+                  " < ", InpMinRRRatio, ". SL=", NormalizeDouble(PriceInPips(symbol, slDistance), 1),
+                  " pips, TP2=", NormalizeDouble(PriceInPips(symbol, tp2Dist), 1), " pips. Skipping.");
+            return;
+         }
+
+         double tp   = NormalizeDouble(entryPrice + tp2Dist, digits);
          double lots = CalculateLotSize(symbol, slDistance);
 
          Print(">>> PLACING BUYSTOP ", symbol,
@@ -451,7 +498,8 @@ void ProcessSymbol(int symIdx)
                " | ADX=", NormalizeDouble(adxBuf[1], 1),
                " (+DI=", NormalizeDouble(plusDI[1], 1), " > -DI=", NormalizeDouble(minusDI[1], 1), ")",
                " | Range=", NormalizeDouble(PriceInPips(symbol, range), 1), " pips",
-               " | SL=", NormalizeDouble(slDistance / point, 0), " pts");
+               " | SL=", NormalizeDouble(slDistance / point, 0), " pts",
+               " | R:R=", NormalizeDouble(rrRatio, 2));
 
          ulong ticket = tradeManager.PlaceBuyStop(symbol, lots, entryPrice, sl, tp);
          if(ticket > 0)
@@ -478,7 +526,17 @@ void ProcessSymbol(int symIdx)
          if(slDistance < minStopDist) slDistance = minStopDist;
          sl = NormalizeDouble(entryPrice + slDistance, digits);
 
-         double tp   = NormalizeDouble(entryPrice - range * InpTP2Mult, digits);
+         double tp2Dist = range * InpTP2Mult;
+         double rrRatio = (slDistance > 0) ? (tp2Dist / slDistance) : 0;
+         if(rrRatio < InpMinRRRatio)
+         {
+            Print(symbol, " - Short R:R too low: ", NormalizeDouble(rrRatio, 2),
+                  " < ", InpMinRRRatio, ". SL=", NormalizeDouble(PriceInPips(symbol, slDistance), 1),
+                  " pips, TP2=", NormalizeDouble(PriceInPips(symbol, tp2Dist), 1), " pips. Skipping.");
+            return;
+         }
+
+         double tp   = NormalizeDouble(entryPrice - tp2Dist, digits);
          double lots = CalculateLotSize(symbol, slDistance);
 
          Print(">>> PLACING SELLSTOP ", symbol,
@@ -486,7 +544,8 @@ void ProcessSymbol(int symIdx)
                " | ADX=", NormalizeDouble(adxBuf[1], 1),
                " (-DI=", NormalizeDouble(minusDI[1], 1), " > +DI=", NormalizeDouble(plusDI[1], 1), ")",
                " | Range=", NormalizeDouble(PriceInPips(symbol, range), 1), " pips",
-               " | SL=", NormalizeDouble(slDistance / point, 0), " pts");
+               " | SL=", NormalizeDouble(slDistance / point, 0), " pts",
+               " | R:R=", NormalizeDouble(rrRatio, 2));
 
          ulong ticket = tradeManager.PlaceSellStop(symbol, lots, entryPrice, sl, tp);
          if(ticket > 0)
