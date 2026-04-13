@@ -97,6 +97,7 @@ input ENUM_TIMEFRAMES   InpTimeframe        = PERIOD_M15;   // Chart Timeframe
 SBreakoutData  g_symbols[];
 int            g_symbolCount = 0;
 bool           g_dailyTargetHit = false;  // When true: manage existing trades only, no new entries
+datetime       g_lastTargetResetDay = 0;  // Day on which g_dailyTargetHit was last reset
 
 //--- Trade manager
 CTradeManager tradeManager;
@@ -607,9 +608,12 @@ void ResetIfNewDay(int symIdx)
       g_symbols[symIdx].asianHigh    = 0;
       g_symbols[symIdx].asianLow     = 999999;
       g_symbols[symIdx].rangeSize    = 0;
-      // Reset daily target flag when a new day begins (only needs to reset once)
-      if(symIdx == 0)
-         g_dailyTargetHit = false;
+   }
+   // Reset daily target flag reliably using a dedicated day tracker
+   if(today != g_lastTargetResetDay)
+   {
+      g_lastTargetResetDay = today;
+      g_dailyTargetHit     = false;
    }
 }
 

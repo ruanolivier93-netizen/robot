@@ -379,6 +379,7 @@ void ProcessSymbol(int symIdx)
    //  Skip dead/quiet markets where mean reversion trades are unprofitable
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
    int    digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   // For fractional pip brokers (5-digit EURUSD, 3-digit USDJPY), 1 pip = 10 points
    double minATRPrice = (digits == 5 || digits == 3) ? InpMinATRPips * 10.0 * point
                                                       : InpMinATRPips * point;
    if(atrValue < minATRPrice)
@@ -433,7 +434,10 @@ void ProcessSymbol(int symIdx)
          {
             if(close1 > bbLowerBuffer[1])
             {
-               // Stochastic: %K crossed above %D from oversold zone
+               // Stochastic momentum confirmation:
+               // (1) %K was at or below %D on prior bar (not yet crossed)
+               // (2) %K crossed above %D on last bar (momentum turning up)
+               // (3) The crossover occurred near the oversold zone (not mid-range noise)
                bool stochBuy = (stochKBuffer[2] <= stochDBuffer[2] &&
                                 stochKBuffer[1] > stochDBuffer[1] &&
                                 stochKBuffer[1] < InpStochOversold + InpStochCrossZone);
@@ -465,7 +469,10 @@ void ProcessSymbol(int symIdx)
          {
             if(close1 < bbUpperBuffer[1])
             {
-               // Stochastic: %K crossed below %D from overbought zone
+               // Stochastic momentum confirmation:
+               // (1) %K was at or above %D on prior bar (not yet crossed)
+               // (2) %K crossed below %D on last bar (momentum turning down)
+               // (3) The crossover occurred near the overbought zone (not mid-range noise)
                bool stochSell = (stochKBuffer[2] >= stochDBuffer[2] &&
                                  stochKBuffer[1] < stochDBuffer[1] &&
                                  stochKBuffer[1] > InpStochOverbought - InpStochCrossZone);
