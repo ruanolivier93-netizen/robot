@@ -94,10 +94,10 @@ CTradeManager tradeManager;
 //+------------------------------------------------------------------+
 //| Parse comma-separated symbols                                      |
 //+------------------------------------------------------------------+
-int ParseSymbols(string input, string &result[])
+int ParseSymbols(string inputStr, string &result[])
 {
    string temp[];
-   int count = StringSplit(input, ',', temp);
+   int count = StringSplit(inputStr, ',', temp);
    int valid = 0;
    ArrayResize(result, count);
    for(int i = 0; i < count; i++)
@@ -462,7 +462,6 @@ void ProcessSymbol(int symIdx)
          tp = NormalizeDouble(tp, digits);
 
          double lotSize = CalculateLotSize(symbol, slDistance);
-         double point   = SymbolInfoDouble(symbol, SYMBOL_POINT);
 
          Print(">>> BREAKOUT UP ", symbol,
                " | Close=", close1, " > AsianHigh=", high,
@@ -506,7 +505,6 @@ void ProcessSymbol(int symIdx)
          tp = NormalizeDouble(tp, digits);
 
          double lotSize = CalculateLotSize(symbol, slDistance);
-         double point   = SymbolInfoDouble(symbol, SYMBOL_POINT);
 
          Print(">>> BREAKOUT DOWN ", symbol,
                " | Close=", close1, " < AsianLow=", low,
