@@ -19,7 +19,8 @@
 enum EBreakoutState
 {
    STATE_BUILDING_RANGE,    // Asian session active — tracking high/low
-   STATE_WAITING_BREAKOUT,  // Range defined, waiting for price to break
+   STATE_WAITING_BREAKOUT,  // Range defined, waiting for breakout window to place pending orders
+   STATE_PENDING_ORDER,     // Pending stop orders placed, waiting for fill
    STATE_TRADE_TAKEN,       // Breakout trade opened for today
    STATE_DONE_FOR_DAY       // Daily limit hit or session over
 };
@@ -35,6 +36,8 @@ struct SBreakoutData
    datetime       lastBarTime;
    int            handleATR;
    int            handleADX;
+   ulong          pendingBuyTicket;
+   ulong          pendingSellTicket;
 };
 
 //--- Input parameters
@@ -52,7 +55,7 @@ input double            InpMinRangePips     = 15.0;         // Minimum Asian Ran
 input double            InpMaxRangePips     = 80.0;         // Maximum Asian Range (pips) - skip huge ranges
 input double            InpBreakoutBuffer   = 3.0;          // Buffer above/below range for entry (pips)
 input int               InpADXPeriod        = 14;           // ADX Period (trend strength)
-input double            InpADXMinimum       = 18.0;         // ADX Minimum for breakout confirmation
+input double            InpADXMinimum       = 25.0;         // ADX Minimum for breakout confirmation
 input int               InpATRPeriod        = 14;           // ATR Period
 input double            InpMaxSpread        = 20.0;         // Max Spread (points)
 
@@ -68,7 +71,7 @@ input double            InpTP1Mult          = 1.0;          // TP1 = Range Size 
 input double            InpTP2Mult          = 2.0;          // TP2 = Range Size * this (final target)
 input double            InpPartialClosePC   = 50.0;         // Partial Close % at TP1
 input double            InpBEBufferPts      = 5.0;          // Breakeven Buffer (points)
-input bool              InpUseMidRangeSL    = false;        // SL at mid-range instead of opposite side
+input bool              InpUseMidRangeSL    = true;         // SL at mid-range instead of opposite side
 
 input group "== Stop Loss =="
 input double            InpSLBuffer         = 5.0;          // SL Buffer beyond range (pips)
@@ -79,6 +82,7 @@ input double            InpDailyMaxLossPC   = 2.0;          // Max Daily Loss (%
 input group "== Trailing Stop =="
 input bool              InpUseTrailingStop  = true;         // Enable Trailing Stop
 input double            InpTrailATRMult     = 1.0;          // Trailing Stop ATR Multiplier
+input bool              InpUseTimeExit      = true;         // Close trades at end of breakout window
 input int               InpFridayCutoffHour = 14;           // Friday Cutoff Hour (no new trades after this)
 
 input group "== Timeframe =="
@@ -188,13 +192,15 @@ int OnInit()
    ArrayResize(g_symbols, g_symbolCount);
    for(int i = 0; i < g_symbolCount; i++)
    {
-      g_symbols[i].symbol       = symList[i];
-      g_symbols[i].state        = STATE_BUILDING_RANGE;
-      g_symbols[i].asianHigh    = 0;
-      g_symbols[i].asianLow     = 999999;
-      g_symbols[i].rangeSize    = 0;
-      g_symbols[i].lastResetDay = 0;
-      g_symbols[i].lastBarTime  = 0;
+      g_symbols[i].symbol              = symList[i];
+      g_symbols[i].state               = STATE_BUILDING_RANGE;
+      g_symbols[i].asianHigh           = 0;
+      g_symbols[i].asianLow            = 999999;
+      g_symbols[i].rangeSize           = 0;
+      g_symbols[i].lastResetDay        = 0;
+      g_symbols[i].lastBarTime         = 0;
+      g_symbols[i].pendingBuyTicket    = 0;
+      g_symbols[i].pendingSellTicket   = 0;
 
       g_symbols[i].handleATR = iATR(symList[i], InpTimeframe, InpATRPeriod);
       g_symbols[i].handleADX = iADX(symList[i], InpTimeframe, InpADXPeriod);
@@ -289,8 +295,8 @@ void ProcessSymbol(int symIdx)
    //  Still manages existing positions, just won't open new breakout trades
    bool fridayCutoff = (dt.day_of_week == 5 && hour >= InpFridayCutoffHour);
 
-   //--- Manage trailing stop (every tick, after partial close)
-   if(InpUseTrailingStop && tradeManager.HasOpenPosition(symbol) && tradeManager.WasPartialClosed(symbol))
+   //--- Manage trailing stop (every tick)
+   if(InpUseTrailingStop && tradeManager.HasOpenPosition(symbol))
    {
       double atrBuf[];
       ArraySetAsSeries(atrBuf, true);
@@ -369,25 +375,25 @@ void ProcessSymbol(int symIdx)
       return;
    }
 
-   //--- 2. WAITING FOR BREAKOUT: Check if price breaks above/below range
+   //--- 2. WAITING FOR BREAKOUT: Place pending stop orders at breakout window open
    if(g_symbols[symIdx].state == STATE_WAITING_BREAKOUT)
    {
-      // Only look for breakouts during the breakout window
+      // Only place orders during the breakout window
       if(hour < InpBreakoutStartHr || hour >= InpBreakoutEndHr)
       {
          // Past breakout window — done for today
          if(hour >= InpBreakoutEndHr)
          {
             g_symbols[symIdx].state = STATE_DONE_FOR_DAY;
-            Print(symbol, " - Breakout window ended. No breakout today.");
+            Print(symbol, " - Breakout window ended. No pending orders placed today.");
          }
          return;
       }
 
-      // Only check on new bar (avoid multiple entries on same candle)
+      // Only act on a new bar (place orders once per bar, keep trying if ADX not ready)
       if(!IsNewBar(symIdx)) return;
 
-      // Friday cutoff — skip new entries
+      // Friday cutoff — skip new orders
       if(fridayCutoff) return;
 
       // Spread filter
@@ -397,13 +403,14 @@ void ProcessSymbol(int symIdx)
       // Max total trades check
       if(tradeManager.CountAllPositions() >= InpMaxTotalTrades) return;
 
-      // Already have a position on this symbol?
-      if(tradeManager.HasOpenPosition(symbol)) return;
-
-      // ADX filter — confirm trending conditions
-      double adxBuf[];
-      ArraySetAsSeries(adxBuf, true);
-      if(CopyBuffer(g_symbols[symIdx].handleADX, 0, 0, 2, adxBuf) < 2) return;
+      // ADX filter — use +DI vs -DI for directional bias
+      double adxBuf[], plusDI[], minusDI[];
+      ArraySetAsSeries(adxBuf,  true);
+      ArraySetAsSeries(plusDI,  true);
+      ArraySetAsSeries(minusDI, true);
+      if(CopyBuffer(g_symbols[symIdx].handleADX, 0, 0, 2, adxBuf)  < 2) return;
+      if(CopyBuffer(g_symbols[symIdx].handleADX, 1, 0, 2, plusDI)  < 2) return;
+      if(CopyBuffer(g_symbols[symIdx].handleADX, 2, 0, 2, minusDI) < 2) return;
       if(adxBuf[1] < InpADXMinimum) return;  // Not trending enough
 
       double buffer   = PipsToPrice(symbol, InpBreakoutBuffer);
@@ -411,122 +418,123 @@ void ProcessSymbol(int symIdx)
       double high     = g_symbols[symIdx].asianHigh;
       double low      = g_symbols[symIdx].asianLow;
       double range    = g_symbols[symIdx].rangeSize;
+      double point    = SymbolInfoDouble(symbol, SYMBOL_POINT);
+      int    digits   = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+      double minStopDist = (double)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
 
-      // Check last closed bar for breakout confirmation
-      double close1 = iClose(symbol, InpTimeframe, 1);
-      double high1  = iHigh(symbol, InpTimeframe, 1);
-      double low1   = iLow(symbol, InpTimeframe, 1);
-      double open1  = iOpen(symbol, InpTimeframe, 1);
+      bool bullBias = (plusDI[1]  > minusDI[1]);
+      bool bearBias = (minusDI[1] > plusDI[1]);
 
-      //--- Candle body confirmation: reject weak breakouts (dojis, long wicks)
-      double body1     = MathAbs(close1 - open1);
-      double barRange1 = high1 - low1;
-      bool strongBull  = (barRange1 > 0 && body1 / barRange1 >= 0.5 && close1 > open1);
-      bool strongBear  = (barRange1 > 0 && body1 / barRange1 >= 0.5 && close1 < open1);
-
-      bool breakoutUp   = (close1 > high + buffer) && strongBull;   // Strong bullish close above range
-      bool breakoutDown = (close1 < low - buffer)  && strongBear;   // Strong bearish close below range
-
-      if(breakoutUp)
+      if(bullBias)
       {
-         double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
-         double sl, tp;
-         double slDistance;
+         double entryPrice = NormalizeDouble(high + buffer, digits);
+         double sl, slDistance;
 
          if(InpUseMidRangeSL)
          {
-            // SL at middle of Asian range
-            sl = (high + low) / 2.0;
-            slDistance = ask - sl;
+            sl = NormalizeDouble((high + low) / 2.0, digits);
+            slDistance = entryPrice - sl;
          }
          else
          {
-            // SL at opposite side of range + buffer
-            sl = low - slBuffer;
-            slDistance = ask - sl;
+            sl = NormalizeDouble(low - slBuffer, digits);
+            slDistance = entryPrice - sl;
          }
+         if(slDistance < minStopDist) slDistance = minStopDist;
+         sl = NormalizeDouble(entryPrice - slDistance, digits);
 
-         //--- Enforce minimum stop level
-         double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
-         double minStopPoints = (double)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
-         double minStopDist = minStopPoints * point;
-         if(slDistance < minStopDist)
-            slDistance = minStopDist;
+         double tp   = NormalizeDouble(entryPrice + range * InpTP2Mult, digits);
+         double lots = CalculateLotSize(symbol, slDistance);
 
-         double tp2Dist = range * InpTP2Mult;
-         tp = ask + tp2Dist;
-         sl = ask - slDistance;
-
-         int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-         sl = NormalizeDouble(sl, digits);
-         tp = NormalizeDouble(tp, digits);
-
-         double lotSize = CalculateLotSize(symbol, slDistance);
-
-         Print(">>> BREAKOUT UP ", symbol,
-               " | Close=", close1, " > AsianHigh=", high,
+         Print(">>> PLACING BUYSTOP ", symbol,
+               " @ ", entryPrice, " | AsianHigh=", high,
                " | ADX=", NormalizeDouble(adxBuf[1], 1),
+               " (+DI=", NormalizeDouble(plusDI[1], 1), " > -DI=", NormalizeDouble(minusDI[1], 1), ")",
                " | Range=", NormalizeDouble(PriceInPips(symbol, range), 1), " pips",
-               " | SL=", NormalizeDouble(slDistance/point, 0), " pts");
+               " | SL=", NormalizeDouble(slDistance / point, 0), " pts");
 
-         if(tradeManager.OpenBuy(symbol, lotSize, sl, tp))
-            g_symbols[symIdx].state = STATE_TRADE_TAKEN;
+         ulong ticket = tradeManager.PlaceBuyStop(symbol, lots, entryPrice, sl, tp);
+         if(ticket > 0)
+         {
+            g_symbols[symIdx].pendingBuyTicket = ticket;
+            g_symbols[symIdx].state            = STATE_PENDING_ORDER;
+         }
       }
-      else if(breakoutDown)
+      else if(bearBias)
       {
-         double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
-         double sl, tp;
-         double slDistance;
+         double entryPrice = NormalizeDouble(low - buffer, digits);
+         double sl, slDistance;
 
          if(InpUseMidRangeSL)
          {
-            sl = (high + low) / 2.0;
-            slDistance = sl - bid;
+            sl = NormalizeDouble((high + low) / 2.0, digits);
+            slDistance = sl - entryPrice;
          }
          else
          {
-            sl = high + slBuffer;
-            slDistance = sl - bid;
+            sl = NormalizeDouble(high + slBuffer, digits);
+            slDistance = sl - entryPrice;
          }
+         if(slDistance < minStopDist) slDistance = minStopDist;
+         sl = NormalizeDouble(entryPrice + slDistance, digits);
 
-         //--- Enforce minimum stop level
-         double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
-         double minStopPoints = (double)SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
-         double minStopDist = minStopPoints * point;
-         if(slDistance < minStopDist)
-            slDistance = minStopDist;
+         double tp   = NormalizeDouble(entryPrice - range * InpTP2Mult, digits);
+         double lots = CalculateLotSize(symbol, slDistance);
 
-         double tp2Dist = range * InpTP2Mult;
-         tp = bid - tp2Dist;
-         sl = bid + slDistance;
-
-         int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-         sl = NormalizeDouble(sl, digits);
-         tp = NormalizeDouble(tp, digits);
-
-         double lotSize = CalculateLotSize(symbol, slDistance);
-
-         Print(">>> BREAKOUT DOWN ", symbol,
-               " | Close=", close1, " < AsianLow=", low,
+         Print(">>> PLACING SELLSTOP ", symbol,
+               " @ ", entryPrice, " | AsianLow=", low,
                " | ADX=", NormalizeDouble(adxBuf[1], 1),
+               " (-DI=", NormalizeDouble(minusDI[1], 1), " > +DI=", NormalizeDouble(plusDI[1], 1), ")",
                " | Range=", NormalizeDouble(PriceInPips(symbol, range), 1), " pips",
-               " | SL=", NormalizeDouble(slDistance/point, 0), " pts");
+               " | SL=", NormalizeDouble(slDistance / point, 0), " pts");
 
-         if(tradeManager.OpenSell(symbol, lotSize, sl, tp))
-            g_symbols[symIdx].state = STATE_TRADE_TAKEN;
+         ulong ticket = tradeManager.PlaceSellStop(symbol, lots, entryPrice, sl, tp);
+         if(ticket > 0)
+         {
+            g_symbols[symIdx].pendingSellTicket = ticket;
+            g_symbols[symIdx].state             = STATE_PENDING_ORDER;
+         }
       }
       return;
    }
 
-   //--- 3. TRADE TAKEN: Just manage existing position
+   //--- 3. PENDING ORDER: Wait for pending stop order to be filled or cancelled
+   if(g_symbols[symIdx].state == STATE_PENDING_ORDER)
+   {
+      // If a position was opened (order filled), cancel any remaining pending order
+      if(tradeManager.HasOpenPosition(symbol))
+      {
+         tradeManager.CancelPendingOrders(symbol);
+         g_symbols[symIdx].pendingBuyTicket  = 0;
+         g_symbols[symIdx].pendingSellTicket = 0;
+         g_symbols[symIdx].state             = STATE_TRADE_TAKEN;
+         return;
+      }
+
+      // Cancel pending orders at end of breakout window or Friday cutoff
+      if(hour >= InpBreakoutEndHr || fridayCutoff)
+      {
+         Print(symbol, " - Breakout window ended. Cancelling pending orders.");
+         tradeManager.CancelPendingOrders(symbol);
+         g_symbols[symIdx].pendingBuyTicket  = 0;
+         g_symbols[symIdx].pendingSellTicket = 0;
+         g_symbols[symIdx].state             = STATE_DONE_FOR_DAY;
+      }
+      return;
+   }
+
+   //--- 4. TRADE TAKEN: Just manage existing position
    if(g_symbols[symIdx].state == STATE_TRADE_TAKEN)
    {
       // If position was closed (by SL/TP), mark done for day (1 trade per symbol per day)
       if(!tradeManager.HasOpenPosition(symbol))
+      {
          g_symbols[symIdx].state = STATE_DONE_FOR_DAY;
+         return;
+      }
 
-      // Close open trades at end of breakout window (time exit)
-      if(hour >= InpBreakoutEndHr && tradeManager.HasOpenPosition(symbol))
+      // Close open trades at end of breakout window (optional time exit)
+      if(InpUseTimeExit && hour >= InpBreakoutEndHr)
       {
          Print(symbol, " - Session ending. Closing breakout trade.");
          tradeManager.CloseAllPositions(symbol);
@@ -535,7 +543,7 @@ void ProcessSymbol(int symIdx)
       return;
    }
 
-   //--- 4. DONE FOR DAY: Nothing to do
+   //--- 5. DONE FOR DAY: Nothing to do
    // (waits for ResetIfNewDay to reset state)
 }
 
@@ -547,11 +555,13 @@ void ResetIfNewDay(int symIdx)
    datetime today = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
    if(today != g_symbols[symIdx].lastResetDay)
    {
-      g_symbols[symIdx].lastResetDay = today;
-      g_symbols[symIdx].state        = STATE_BUILDING_RANGE;
-      g_symbols[symIdx].asianHigh    = 0;
-      g_symbols[symIdx].asianLow     = 999999;
-      g_symbols[symIdx].rangeSize    = 0;
+      g_symbols[symIdx].lastResetDay        = today;
+      g_symbols[symIdx].state               = STATE_BUILDING_RANGE;
+      g_symbols[symIdx].asianHigh           = 0;
+      g_symbols[symIdx].asianLow            = 999999;
+      g_symbols[symIdx].rangeSize           = 0;
+      g_symbols[symIdx].pendingBuyTicket    = 0;
+      g_symbols[symIdx].pendingSellTicket   = 0;
    }
 }
 
