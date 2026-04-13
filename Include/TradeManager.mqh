@@ -64,6 +64,9 @@ public:
    double         GetAllOpenProfit();
    double         GetPositionSLDistance(string symbol);
    bool           WasPartialClosed(string symbol);
+   ulong          PlaceBuyStop(string symbol, double lots, double price, double sl, double tp);
+   ulong          PlaceSellStop(string symbol, double lots, double price, double sl, double tp);
+   bool           CancelPendingOrders(string symbol);
 };
 
 //+------------------------------------------------------------------+
@@ -497,5 +500,90 @@ bool CTradeManager::ManagePartialClose(string symbol, double tp1Distance, double
       }
    }
    return false;
+}
+
+//+------------------------------------------------------------------+
+ulong CTradeManager::PlaceBuyStop(string symbol, double lots, double price, double sl, double tp)
+{
+   if(CountOpenPositions(symbol) >= m_maxTradesPerSymbol)
+   {
+      Print("Max trades for ", symbol, ". BuyStop skipped.");
+      return 0;
+   }
+
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   price = NormalizeDouble(price, digits);
+   sl    = NormalizeDouble(sl,    digits);
+   tp    = NormalizeDouble(tp,    digits);
+
+   // Pending stop orders use RETURN fill mode universally
+   m_trade.SetTypeFilling(ORDER_FILLING_RETURN);
+
+   if(m_trade.BuyStop(lots, price, symbol, sl, tp, ORDER_TIME_GTC, 0, m_comment))
+   {
+      ulong ticket = m_trade.ResultOrder();
+      Print("BUYSTOP PLACED ", symbol, ": ", lots, " lots @ ", price,
+            " | SL=", sl, " | TP=", tp, " | Ticket=", ticket);
+      int idx = GetOrCreatePCState(symbol);
+      m_pcStates[idx].originalEntryPrice  = price;
+      m_pcStates[idx].originalLots        = lots;
+      m_pcStates[idx].partialClosedTicket = 0;
+      return ticket;
+   }
+   Print("BuyStop ", symbol, " failed. Error=", GetLastError());
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+ulong CTradeManager::PlaceSellStop(string symbol, double lots, double price, double sl, double tp)
+{
+   if(CountOpenPositions(symbol) >= m_maxTradesPerSymbol)
+   {
+      Print("Max trades for ", symbol, ". SellStop skipped.");
+      return 0;
+   }
+
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   price = NormalizeDouble(price, digits);
+   sl    = NormalizeDouble(sl,    digits);
+   tp    = NormalizeDouble(tp,    digits);
+
+   m_trade.SetTypeFilling(ORDER_FILLING_RETURN);
+
+   if(m_trade.SellStop(lots, price, symbol, sl, tp, ORDER_TIME_GTC, 0, m_comment))
+   {
+      ulong ticket = m_trade.ResultOrder();
+      Print("SELLSTOP PLACED ", symbol, ": ", lots, " lots @ ", price,
+            " | SL=", sl, " | TP=", tp, " | Ticket=", ticket);
+      int idx = GetOrCreatePCState(symbol);
+      m_pcStates[idx].originalEntryPrice  = price;
+      m_pcStates[idx].originalLots        = lots;
+      m_pcStates[idx].partialClosedTicket = 0;
+      return ticket;
+   }
+   Print("SellStop ", symbol, " failed. Error=", GetLastError());
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+bool CTradeManager::CancelPendingOrders(string symbol)
+{
+   bool result = true;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) != symbol) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != (long)m_magicNumber) continue;
+
+      if(!m_trade.OrderDelete(ticket))
+      {
+         Print("CancelPendingOrders: Failed to delete order ", ticket, " Error=", GetLastError());
+         result = false;
+      }
+      else
+         Print("Pending order ", ticket, " cancelled for ", symbol);
+   }
+   return result;
 }
 //+------------------------------------------------------------------+
